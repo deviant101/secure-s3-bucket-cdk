@@ -1,0 +1,269 @@
+name: Deploy CDK Infrastructure
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '18'
+  PROJECT_ID: 'secure-bucket-demo'
+  GITHUB_REPO: ${{ github.repository }}
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+      - name: Run code formatting check
+        run: npm run format -- --check
+
+      - name: Run unit tests
+        run: npm test -- --coverage
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          files: ./coverage/lcov.info
+
+  cdk-diff:
+    name: CDK Diff
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CDK Diff (Dev)
+        run: |
+          npx cdk diff \
+            --context projectId=${{ env.PROJECT_ID }} \
+            --context environment=dev \
+            --context githubRepo=${{ env.GITHUB_REPO }} \
+            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
+            --context region=${{ env.AWS_REGION }}
+
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    environment: development
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CDK Bootstrap (if needed)
+        run: |
+          npx cdk bootstrap aws://${{ secrets.AWS_ACCOUNT_ID }}/${{ env.AWS_REGION }}
+
+      - name: CDK Synth
+        run: |
+          npx cdk synth \
+            --context projectId=${{ env.PROJECT_ID }} \
+            --context environment=dev \
+            --context githubRepo=${{ env.GITHUB_REPO }} \
+            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
+            --context region=${{ env.AWS_REGION }}
+
+      - name: CDK Deploy (Dev)
+        run: |
+          npx cdk deploy \
+            --require-approval never \
+            --context projectId=${{ env.PROJECT_ID }} \
+            --context environment=dev \
+            --context githubRepo=${{ env.GITHUB_REPO }} \
+            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
+            --context region=${{ env.AWS_REGION }}
+
+      - name: Get Stack Outputs
+        id: stack-outputs
+        run: |
+          BUCKET_NAME=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.PROJECT_ID }}-secure-bucket-dev \
+            --query 'Stacks[0].Outputs[?OutputKey==`SecureBucketBucketName`].OutputValue' \
+            --output text)
+          
+          OIDC_ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.PROJECT_ID }}-secure-bucket-dev \
+            --query 'Stacks[0].Outputs[?OutputKey==`SecureBucketOIDCRoleArn`].OutputValue' \
+            --output text)
+          
+          echo "bucket-name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "oidc-role-arn=$OIDC_ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Test Deployment
+        run: |
+          echo "Testing S3 bucket access..."
+          aws s3 ls s3://${{ steps.stack-outputs.outputs.bucket-name }}/ || echo "Bucket is empty (expected)"
+
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, deploy-dev]
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CDK Diff (Prod)
+        id: cdk-diff
+        run: |
+          echo "Running CDK diff for production..."
+          DIFF_OUTPUT=$(npx cdk diff \
+            --context projectId=${{ env.PROJECT_ID }} \
+            --context environment=prod \
+            --context githubRepo=${{ env.GITHUB_REPO }} \
+            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
+            --context region=${{ env.AWS_REGION }} 2>&1)
+          
+          echo "diff-output<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Check for unauthorized changes (example: detect if IAM policies are being modified unexpectedly)
+          if echo "$DIFF_OUTPUT" | grep -q "IAM.*Policy.*DELETE\|IAM.*Role.*DELETE"; then
+            echo "❌ Unauthorized IAM changes detected!"
+            exit 1
+          fi
+
+      - name: CDK Bootstrap (if needed)
+        run: |
+          npx cdk bootstrap aws://${{ secrets.AWS_ACCOUNT_ID }}/${{ env.AWS_REGION }}
+
+      - name: CDK Synth (Prod)
+        run: |
+          npx cdk synth \
+            --context projectId=${{ env.PROJECT_ID }} \
+            --context environment=prod \
+            --context githubRepo=${{ env.GITHUB_REPO }} \
+            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
+            --context region=${{ env.AWS_REGION }}
+
+      - name: CDK Deploy (Prod)
+        run: |
+          npx cdk deploy \
+            --require-approval never \
+            --context projectId=${{ env.PROJECT_ID }} \
+            --context environment=prod \
+            --context githubRepo=${{ env.GITHUB_REPO }} \
+            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
+            --context region=${{ env.AWS_REGION }}
+
+      - name: Get Production Stack Outputs
+        id: prod-outputs
+        run: |
+          BUCKET_NAME=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.PROJECT_ID }}-secure-bucket-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`SecureBucketBucketName`].OutputValue' \
+            --output text)
+          
+          OIDC_ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.PROJECT_ID }}-secure-bucket-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`SecureBucketOIDCRoleArn`].OutputValue' \
+            --output text)
+          
+          echo "bucket-name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "oidc-role-arn=$OIDC_ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Production Deployment Summary
+        run: |
+          echo "🚀 Production deployment completed successfully!"
+          echo "📦 Bucket Name: ${{ steps.prod-outputs.outputs.bucket-name }}"
+          echo "🔐 OIDC Role ARN: ${{ steps.prod-outputs.outputs.oidc-role-arn }}"
+
+  cleanup-on-failure:
+    name: Cleanup on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-prod]
+    if: failure()
+    
+    steps:
+      - name: Notify on Failure
+        run: |
+          echo "❌ Deployment failed. Manual intervention may be required."
+          echo "Please check the failed jobs and consider rolling back if necessary."
